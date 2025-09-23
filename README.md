@@ -1,0 +1,2 @@
+# AI-Hackathon-BDC6
+This is a repo for the codes used in creating agentic AI and MLOps
