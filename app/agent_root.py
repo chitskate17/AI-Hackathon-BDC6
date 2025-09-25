@@ -1,80 +1,75 @@
-# app/agent_root.py
+import os
+from datetime import date
+
 from google.adk.agents import Agent
-from google.adk.tools import FunctionTool
+from google.adk.agents.callback_context import CallbackContext
+from google.genai import types
 
-from app.tools.bq_tools import run_sql, write_table
-from app.tools.ml_tools import predict_features, explain_features
-from app.tools.decision import decide
-from app.tools.notify import forward_to_slack
+# Import sub-agents
+from .agents.data_agent.agent import data_agent
+from .agents.ml_agent.agent import ml_agent
+from .agents.alert_agent.agent import alert_agent
 
-# ----------------------------
-# Tools wrapped using FunctionTool
-# ----------------------------
+# Import root prompts
+from .prompts import return_instructions_root
 
-bq_tool = FunctionTool(
-    func=run_sql,
-    name="run_sql",
-    description="Execute SQL query in BigQuery and return results as JSON",
-    args_schema={
-        "sql": {"type": "string", "description": "SQL query string"},
-        "max_rows": {"type": "integer", "description": "Maximum rows to fetch", "default": 1000}
-    },
-    return_schema={"type": "object", "description": "Query results as list of dicts"}
-)
+# Import workflow tools
+from .tools.alert_workflow import process_alert_workflow_tool
 
-predict_tool = FunctionTool(
-    func=predict_features,
-    name="predict_alert",
-    description="Predict if an alert should be suppressed or forwarded using BQML model",
-    args_schema={"alert": {"type": "object", "description": "Alert data dictionary"}},
-    return_schema={"type": "object", "description": "Prediction result with label and probability"}
-)
+date_today = date.today()
 
-explain_tool = FunctionTool(
-    func=explain_features,
-    name="explain_decision",
-    description="Provide rationale for alert suppression/forwarding",
-    args_schema={
-        "alert": {"type": "object", "description": "Alert dictionary"},
-        "prediction": {"type": "object", "description": "Prediction dictionary"}
-    },
-    return_schema={"type": "object", "description": "Decision explanation"}
-)
+def setup_before_agent_call(callback_context: CallbackContext):
+    """Setup before calling the root agent."""
+    if "all_db_settings" not in callback_context.state:
+        callback_context.state["all_db_settings"] = {"use_database": "BigQuery"}
 
-decision_tool = FunctionTool(
-    func=decide,
-    name="decision_tool",
-    description="Decide whether to suppress or forward an alert based on ML predictions and rules",
-    args_schema={
-        "alert_row": {"type": "object", "description": "Alert data dictionary"},
-        "ml_pred": {"type": "object", "description": "ML prediction dictionary"}
-    },
-    return_schema={"type": "object", "description": "Decision result with 'decision' and 'reason' fields"}
-)
+        # Alert management settings
+        if "alert_settings" not in callback_context.state:
+            callback_context.state["alert_settings"] = {
+                "suppression_threshold": 0.8,
+                "duplicate_window_minutes": 5,
+                "critical_always_forward": True,
+                "flapping_window_minutes": 30,
+                "flapping_threshold": 3,
+                "self_resolve_threshold_minutes": 15,
+                "min_resolution_count": 3
+            }
 
-notify_tool = FunctionTool(
-    func=forward_to_slack,
-    name="forward_alert",
-    description="Forward actionable alert to target channel",
-    args_schema={"alert": {"type": "object", "description": "Alert dictionary"}},
-    return_schema={"type": "object", "description": "Forwarding status"}
-)
+    # Database settings for sub-agents
+    callback_context.state["database_settings"] = {
+        "bq_data_project_id": os.getenv("BQ_PROJECT_ID", "ruckusoperations"),
+        "bq_dataset_id": os.getenv("BQ_DATASET_ID", "BDC_6"),
+        "bq_schema_and_samples": f"""
+        Table: `{os.getenv('BQ_PROJECT_ID', 'ruckusoperations')}.{os.getenv('BQ_DATASET_ID', 'BDC_6')}.alerts_data`
+        Total Rows: 149,899
+        
+        Schema:
+        - source: STRING (values: 'pagerduty', 'jira', 'icinga')
+        - alert_id: STRING (filled for pagerduty/jira, may be NULL for icinga)
+        - title: STRING (always filled)
+        - host: STRING (always filled)
+        - severity: STRING (values: severity-1, severity-2, severity-3, Sev1, Sev2, Sev3) - filled for pagerduty/jira, may be NULL for icinga
+        - status: STRING (filled for pagerduty/jira, may be NULL for icinga)
+        - created_at: TIMESTAMP (always filled)
+        - resolved_at: TIMESTAMP (filled for pagerduty/jira, may be NULL for icinga)
+        - decision_reason: STRING (values: 'keep' or 'suppressed: jira exists')
+        
+        Data Completeness:
+        - pagerduty/jira: All fields filled
+        - icinga: Only title, host, created_at, decision_reason filled
+        
+        BQML Model: `{os.getenv('BQ_PROJECT_ID', 'ruckusoperations')}.{os.getenv('BQ_DATASET_ID', 'BDC_6')}.alert_classifier`
+        """
+    }
 
-# ----------------------------
-# Root agent
-# ----------------------------
 
 root_agent = Agent(
-    name="root_alerts_agent",
-    model="gemini-1.5-mini",  # change if needed
-    description="Orchestrator that processes alerts: query BQ, call ML, decide, notify",
-    instruction="""
-        Use the provided tools to fetch pending alerts, call prediction tool,
-        make a decision using the decision tool and forward actionable alerts.
-        Output a short human-friendly summary for each batch processed.
-    """,
-    tools=[bq_tool, predict_tool, explain_tool, decision_tool, notify_tool]
+    model=os.getenv("ROOT_AGENT_MODEL", "gemini-2.0-flash-exp"),
+    name="alert_management_orchestrator",
+    instruction=return_instructions_root(),
+    global_instruction=f"You are an Alert Management Multi-Agent Orchestrator System for suppressing noisy alerts. Today's date: {date_today}",
+    sub_agents=[data_agent, ml_agent, alert_agent],
+    tools=[process_alert_workflow_tool],
+    before_agent_callback=setup_before_agent_call,
+    generate_content_config=types.GenerateContentConfig(temperature=0.01),
 )
-
-def get_agent():
-    return root_agent
